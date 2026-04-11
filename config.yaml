@@ -1,0 +1,86 @@
+# PDF Translation Pipeline Configuration
+# =====================================
+# All API settings are generic - configure according to your provider
+
+# Input/Output Paths
+paths:
+  input_dir: "data-new"             # Input directory containing data-new/{category}/{layout}/{paper_id}/hybrid_auto/
+  output_dir: "runs/output"         # Output directory for translated PDFs
+  
+# Translation Agent Configuration
+translation:
+  # API Configuration - Fill in your own API provider details
+  api:
+    base_url: ""                    # e.g., "https://your-provider.example/v1"
+    api_key: ""                     # Your API key (or use env var like ${TRANSLATION_API_KEY})
+    model: ""                       # e.g., "provider-model-large"
+  
+  # Translation Settings
+  target_language: "zh"             # Target language (zh = Chinese)
+  m0_plain_translation: true        # Use plain translation in M0; later rounds rely on guided rewrite
+  enable_isolength: true            # Enable fixed-length translation
+  concurrency: 4                    # Number of concurrent translation tasks
+  temperature: 0.2                  # LLM temperature
+
+# Reflow Agent Configuration
+reflow:
+  # API Configuration - Can use same or different provider
+  api:
+    base_url: ""                    # e.g., "https://your-provider.example/v1"
+    api_key: ""                     # Your API key (or use env var like ${REFLOW_API_KEY})
+    model: ""                       # e.g., "provider-model-medium"
+  
+  # Reflow Settings
+  enabled: true                     # Enable reflow process
+  max_rounds: 3                     # Maximum total rounds, including M0 simulation/probe
+  concurrency: 2                    # Number of concurrent reflow tasks
+  temperature: 0.3                  # LLM temperature
+
+# PDF Rendering Configuration
+rendering:
+  formula_dpi: 300                  # DPI for formula rendering (higher = clearer)
+  output_dpi: 150                   # DPI for output PDF
+
+# Parse Automation
+parse:
+  enabled: false                    # If true, invoke external parser when parsed JSON is missing
+  command_template: ""              # Example: "mineru -i {pdf_path} -o {output_dir}"
+  output_subdir: "hybrid_auto"      # Parser output directory relative to each paper dir
+  prefer_enriched: true             # Prefer *_enriched.json when multiple JSONs exist
+
+# Planner / System Flow
+planner:
+  enable_column_joint_optimization: true   # Enable experimental column-level joint optimization
+  style_policy:
+    lock_font_size: true                   # Freeze golden font size through reflow and rendering
+    char_spacing_abs_min: 0.0              # Hard lower bound for char spacing
+    char_spacing_abs_max: 0.14             # Hard upper bound for char spacing
+    char_spacing_max_global_spread: 0.05   # Keep global char spacing distribution tight
+    char_spacing_max_delta_from_bucket: 0.025  # Per-bucket deviation limit around frozen char spacing
+
+# Operation Ablation
+ablation:
+  operation_policy:
+    allow_rewriting: true
+    allow_line_spacing: true
+    allow_char_spacing: true
+    allow_font_size: true
+  
+# Processing Options
+processing:
+  categories:                       # Categories to process (supports formula/figure/general aliases)
+    - formula
+    - figure
+    - general
+  layouts:                          # Layouts to process (supports single_column/double_column/complex_layout aliases)
+    - single_column
+    - double_column
+    - complex_layout
+  
+  skip_existing: true               # Skip already processed files
+  save_intermediate: true           # Save intermediate JSON files
+
+# Logging
+logging:
+  level: "INFO"                     # DEBUG, INFO, WARNING, ERROR
+  log_file: "translation.log"       # Log file path

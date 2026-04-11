@@ -1,0 +1,30 @@
+{
+  "cases": [
+    {
+      "name": "baseline",
+      "translation": {
+        "base_url": "https://your-provider.example/v1",
+        "api_key": "${TRANSLATION_API_KEY}",
+        "model": "provider-model-large"
+      },
+      "reflow": {
+        "base_url": "https://your-provider.example/v1",
+        "api_key": "${REFLOW_API_KEY}",
+        "model": "provider-model-medium"
+      }
+    },
+    {
+      "name": "same_model_dual_role",
+      "translation": {
+        "base_url": "https://your-provider.example/v1",
+        "api_key": "${TRANSLATION_API_KEY}",
+        "model": "provider-model-shared"
+      },
+      "reflow": {
+        "base_url": "https://your-provider.example/v1",
+        "api_key": "${REFLOW_API_KEY}",
+        "model": "provider-model-shared"
+      }
+    }
+  ]
+}
