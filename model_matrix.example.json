@@ -3,27 +3,27 @@
     {
       "name": "baseline",
       "translation": {
-        "base_url": "https://your-provider.example/v1",
+        "base_url": "https://api.openai.com/v1",
         "api_key": "${TRANSLATION_API_KEY}",
-        "model": "provider-model-large"
+        "model": "gpt-4o"
       },
       "reflow": {
-        "base_url": "https://your-provider.example/v1",
+        "base_url": "https://api.openai.com/v1",
         "api_key": "${REFLOW_API_KEY}",
-        "model": "provider-model-medium"
+        "model": "gpt-5"
       }
     },
     {
       "name": "same_model_dual_role",
       "translation": {
-        "base_url": "https://your-provider.example/v1",
+        "base_url": "https://api.openai.com/v1",
         "api_key": "${TRANSLATION_API_KEY}",
-        "model": "provider-model-shared"
+        "model": "gpt-5"
       },
       "reflow": {
-        "base_url": "https://your-provider.example/v1",
+        "base_url": "https://api.openai.com/v1",
         "api_key": "${REFLOW_API_KEY}",
-        "model": "provider-model-shared"
+        "model": "gpt-5"
       }
     }
   ]

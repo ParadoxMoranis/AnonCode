@@ -117,7 +117,7 @@ class TranslationAgentNoIsoLength:
             'author', 'affiliation', 'reference',
             'aside_text', 'page_number',
         }
-        
+
         self.TARGET_TYPES = {
             'text', 'title', 'section_header', 'page_header', 'header', 'footer',
             'caption', 'figure_caption', 'table_caption', 'footnote', 'abstract'
@@ -152,9 +152,72 @@ class TranslationAgentNoIsoLength:
         
         self.layout_mode = "single_col"
         self.global_style_config = {}
-        self._font_size_cache = {} 
+        self._font_size_cache = {}
         self._split_layout_tool = None
         print(f"🌍 [TranslationAgentNoIsoLength] Mode: Simple Translation (NO Iso-Length)")
+
+    def _safe_bbox(self, item: Dict) -> List[float]:
+        bbox = item.get('bbox', [0, 0, 0, 0]) or [0, 0, 0, 0]
+        if len(bbox) != 4:
+            return [0, 0, 0, 0]
+        return [float(v) for v in bbox]
+
+    def _sort_group_in_reading_order(self, group: List[Dict]) -> List[Dict]:
+        if len(group) <= 1:
+            return group
+
+        grouped_by_page: Dict[int, List[Dict]] = {}
+        for entry in group:
+            item = entry['item']
+            page_idx = int(item.get('page_idx', 0) or 0)
+            grouped_by_page.setdefault(page_idx, []).append(entry)
+
+        ordered: List[Dict] = []
+        for page_idx in sorted(grouped_by_page):
+            page_group = grouped_by_page[page_idx]
+            if len(page_group) <= 1:
+                ordered.extend(page_group)
+                continue
+
+            bboxes = [self._safe_bbox(entry['item']) for entry in page_group]
+            min_x = min(b[0] for b in bboxes)
+            max_x = max(b[2] for b in bboxes)
+            page_span = max(1.0, max_x - min_x)
+            centers = sorted((b[0] + b[2]) / 2.0 for b in bboxes)
+            widths = [max(1.0, b[2] - b[0]) for b in bboxes]
+            two_column_like = (
+                len(page_group) >= 2
+                and sum(1 for width in widths if width <= page_span * 0.72) >= 2
+                and (centers[-1] - centers[0]) >= page_span * 0.22
+            )
+
+            if not two_column_like:
+                ordered.extend(
+                    sorted(
+                        page_group,
+                        key=lambda entry: (
+                            self._safe_bbox(entry['item'])[1],
+                            self._safe_bbox(entry['item'])[0],
+                        ),
+                    )
+                )
+                continue
+
+            split_x = sum(centers) / len(centers)
+
+            def sort_key(entry: Dict):
+                bbox = self._safe_bbox(entry['item'])
+                width = max(1.0, bbox[2] - bbox[0])
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                spans_both_cols = width >= page_span * 0.78
+                if spans_both_cols:
+                    return (-1, bbox[1], bbox[0])
+                col = 0 if center_x <= split_x else 1
+                return (col, bbox[1], bbox[0])
+
+            ordered.extend(sorted(page_group, key=sort_key))
+
+        return ordered
 
     REFERENCE_HEADINGS = {
         'references', 'reference', 'bibliography', 'works cited'
@@ -337,7 +400,7 @@ class TranslationAgentNoIsoLength:
         ordered_entries = []
         for lid in sorted_lids:
             group = groups[lid]
-            group.sort(key=lambda x: (x['item']['page_idx'], x['item']['bbox'][1]))
+            group = self._sort_group_in_reading_order(group)
             first_item = group[0]['item']
             raw_text = first_item.get('context') or " ".join(g['item'].get('text', '') for g in group)
             corrected_type = self._correct_element_type_visually(first_item, body_base_size, doc)
@@ -385,30 +448,9 @@ class TranslationAgentNoIsoLength:
             if self._is_reference_heading(stripped_text):
                 in_reference_section = True
                 preserve = True
-            elif corrected_type == 'reference' or 'reference' in raw_type:
-                preserve = True
-                if page_idx >= late_page_threshold and (
-                    strong_reference or weak_reference or len(stripped_text) <= 32
-                ):
-                    in_reference_section = True
-            elif strong_reference and (
-                in_reference_section
-                or page_idx >= late_page_threshold
-                or corrected_type in {'footnote', 'footer', 'header'}
-            ):
+            elif 'reference' in raw_type:
                 preserve = True
                 in_reference_section = True
-            elif in_reference_section and (weak_reference or fragment_reference):
-                preserve = True
-            elif in_reference_section and corrected_type in {'text', 'footnote'} and (
-                fragment_reference
-                or (
-                    len(stripped_text) >= 20
-                    and re.search(r'\b(?:19|20)\d{2}[a-z]?\b', stripped_text)
-                    and (',' in stripped_text or '&' in stripped_text)
-                )
-            ):
-                preserve = True
 
             if preserve and group:
                 for g in group:
@@ -417,7 +459,7 @@ class TranslationAgentNoIsoLength:
     def _should_preserve_original_group(self, corrected_type: str, raw_text: str, group: List[Dict]) -> bool:
         if self._is_reference_heading(raw_text):
             return True
-        if corrected_type == 'reference':
+        if any('reference' in (g['item'].get('type', '').lower()) for g in group):
             return True
         return any(g['item'].get('_preserve_reference') for g in group)
 
@@ -519,23 +561,70 @@ class TranslationAgentNoIsoLength:
                 math_like_count += 1
         math_like_ratio = math_like_count / max(1, len(body_items))
 
-        target_line = 1.5
-        target_natural_fill = 0.91
+        target_line = 1.46
+        target_natural_fill = 0.988
 
         if avg_width_ratio < 0.78:
-            target_line -= 0.05
-        if avg_src_density >= 80:
             target_line -= 0.03
-            target_natural_fill += 0.01
-        if math_like_ratio >= 0.10:
+            target_natural_fill += 0.008
+        if avg_src_density <= 62:
             target_line -= 0.02
-            target_natural_fill -= 0.01
+            target_natural_fill += 0.012
+        if avg_src_density <= 52:
+            target_line -= 0.02
+            target_natural_fill += 0.014
+        if avg_src_density <= 44:
+            target_line -= 0.02
+            target_natural_fill += 0.014
+        if avg_src_density >= 80:
+            target_line -= 0.02
+            target_natural_fill += 0.015
+        if math_like_ratio >= 0.10:
+            target_line -= 0.01
+            target_natural_fill -= 0.004
         if avg_width_ratio >= 0.84 and avg_src_density <= 70 and math_like_ratio <= 0.05:
-            target_line += 0.03
-            target_natural_fill += 0.01
+            target_line += 0.01
+            target_natural_fill += 0.014
 
-        target_line = round(max(1.4, min(1.55, target_line)) * 20) / 20
-        target_natural_fill = max(0.88, min(0.93, target_natural_fill))
+        target_line = round(max(1.34, min(1.50, target_line)) * 20) / 20
+        target_natural_fill = max(0.968, min(0.997, target_natural_fill))
+        return target_line, target_natural_fill
+
+    def _estimate_double_col_body_targets(self, body_items: List[Dict], page_width: float, avg_src_density: float) -> Tuple[float, float]:
+        widths = [
+            max(1.0, float(item['bbox'][2]) - float(item['bbox'][0]))
+            for item in body_items
+            if len(item.get('bbox', [])) == 4
+        ]
+        avg_width_ratio = (statistics.mean(widths) / page_width) if widths and page_width > 0 else 0.48
+        math_like_count = 0
+        for item in body_items:
+            text = item.get('text', '') or ''
+            if '$' in text or re.search(r'\\[A-Za-z]+', text):
+                math_like_count += 1
+        math_like_ratio = math_like_count / max(1, len(body_items))
+
+        target_line = 1.32
+        target_natural_fill = 0.952
+
+        if avg_width_ratio < 0.48:
+            target_natural_fill += 0.015
+        if avg_src_density <= 60:
+            target_natural_fill += 0.008
+        if avg_src_density <= 52:
+            target_natural_fill += 0.01
+        if avg_src_density <= 44:
+            target_natural_fill += 0.01
+        if avg_src_density >= 56:
+            target_natural_fill += 0.008
+        if avg_src_density <= 46:
+            target_natural_fill += 0.01
+        if math_like_ratio >= 0.12:
+            target_natural_fill -= 0.004
+        elif math_like_ratio <= 0.05 and avg_width_ratio < 0.5:
+            target_natural_fill += 0.015
+
+        target_natural_fill = max(0.938, min(0.968, target_natural_fill))
         return target_line, target_natural_fill
 
     def _clean_hallucinations(self, text: str) -> str:
@@ -927,17 +1016,17 @@ class TranslationAgentNoIsoLength:
             if self.layout_mode == "single_col":
                 target_line, target_natural_fill = self._estimate_single_col_body_targets(body_items, page_width, avg_src_density)
             else:
-                target_line, target_natural_fill = 1.35, 0.80
+                target_line, target_natural_fill = self._estimate_double_col_body_targets(body_items, page_width, avg_src_density)
             natural_fill = (0.6 * (orig_body_size**2) * target_line * 1.1) / avg_src_density
             
             upscale_factor = 1.0
             if natural_fill < target_natural_fill:
-                upscale_factor = min((target_natural_fill / natural_fill) ** 0.5, 1.4 if self.layout_mode == "single_col" else 1.3)
-            
-            golden_body_size = max(9.0, min(12.0, orig_body_size * upscale_factor))
-            styles['body'] = {'size': round(golden_body_size*2)/2, 'line': target_line, 'char': 0.05, 'font_key': 'body'}
+                upscale_factor = min((target_natural_fill / natural_fill) ** 0.5, 1.72 if self.layout_mode == "single_col" else 1.58)
+
+            golden_body_size = max(10.0, min(13.5, orig_body_size * upscale_factor))
+            styles['body'] = {'size': round(golden_body_size*2)/2, 'line': target_line, 'char': 0.04, 'font_key': 'body'}
         else:
-            styles['body'] = {'size': 10.5, 'line': 1.4, 'char': 0.05, 'font_key': 'body'}
+            styles['body'] = {'size': 11.4, 'line': 1.40, 'char': 0.04, 'font_key': 'body'}
             orig_body_size = 9.0
             upscale_factor = 1.0
 
@@ -1006,6 +1095,81 @@ class TranslationAgentNoIsoLength:
                 )
             )
         return tokens
+
+    def _is_terminal_split_token(self, token: str) -> bool:
+        tok = (token or "").strip()
+        return tok in {'。', '！', '？', '；', '：', '.', '!', '?', ';', ':', '”', '"'}
+
+    def _is_soft_pause_token(self, token: str) -> bool:
+        tok = (token or "").strip()
+        return tok in {'，', '、', ',', '）', ')', '】', ']', '」', '』', '》'}
+
+    def _source_prefers_bridge_split(self, items: List[Dict], split_idx: int) -> bool:
+        if split_idx < 0 or split_idx >= len(items) - 1:
+            return False
+
+        left_text = (items[split_idx].get('text') or items[split_idx].get('context') or '').strip()
+        right_text = (items[split_idx + 1].get('text') or items[split_idx + 1].get('context') or '').strip()
+        if not left_text or not right_text:
+            return False
+
+        left_tail = left_text.rstrip()[-1:]
+        right_head = right_text.lstrip()[:1]
+        if not left_tail or not right_head:
+            return False
+
+        # 源文边界若本来就不是句终止点，更适合做“跨栏连续句”。
+        if left_tail not in '.!?;:。！？；：':
+            if re.match(r'[A-Za-z0-9\u4e00-\u9fff(\["“]', right_head):
+                return True
+        return False
+
+    def _score_split_candidate(
+        self,
+        tool: PDFReflowTool,
+        tokens: List[str],
+        start: int,
+        end: int,
+        item: Dict,
+        config: Dict,
+        continuation_mode: bool,
+    ) -> float:
+        candidate = "".join(tokens[start:end]).strip()
+        if not candidate:
+            return float('-inf')
+
+        adjusted = tool._accordion_fit_style(item['bbox'], candidate, dict(config))
+        metrics = tool.simulate_layout_metrics(item['bbox'], candidate, adjusted)
+        if metrics.get('is_overflow'):
+            return float('-inf')
+
+        score = float(metrics.get('fill_ratio', 0.0))
+        prev_tok = tokens[end - 1] if end - 1 >= start else ''
+        next_tok = tokens[end] if end < len(tokens) else ''
+
+        if continuation_mode:
+            if self._is_terminal_split_token(prev_tok):
+                score -= 0.18
+            elif self._is_soft_pause_token(prev_tok):
+                score -= 0.03
+            else:
+                score += 0.08
+
+            next_clean = (next_tok or '').strip()
+            if next_clean and not self._is_terminal_split_token(next_clean) and not self._is_soft_pause_token(next_clean):
+                score += 0.08
+            elif self._is_soft_pause_token(next_clean):
+                score += 0.01
+
+            # 连续句时，优先让左栏更接近装满。
+            score += min(0.08, max(0.0, float(metrics.get('fill_ratio', 0.0)) - 0.82))
+        else:
+            if self._is_terminal_split_token(prev_tok):
+                score += 0.06
+            elif self._is_soft_pause_token(prev_tok):
+                score += 0.02
+
+        return score
 
     def _prefer_split_point(self, tokens: List[str], start: int, end: int) -> int:
         preferred = {'。', '！', '？', '；', '：', '.', '!', '?', ';', ':', '”', '"'}
@@ -1160,8 +1324,10 @@ class TranslationAgentNoIsoLength:
                 split_weights[idx:],
             )
             candidate_ends = self._build_candidate_ends(tokens, start, best_end, source_target_end)
+            continuation_mode = self._source_prefers_bridge_split(items, idx)
 
             chosen_end = None
+            chosen_score = float('-inf')
             seen = set()
             for end in candidate_ends:
                 if end in seen or end <= start:
@@ -1171,8 +1337,18 @@ class TranslationAgentNoIsoLength:
                 if not self._fits_rendered_chunk(tool, item['bbox'], candidate, config):
                     continue
                 if self._can_fit_suffix(tool, tokens, end, items[idx + 1:], config):
-                    chosen_end = end
-                    break
+                    score = self._score_split_candidate(
+                        tool,
+                        tokens,
+                        start,
+                        end,
+                        item,
+                        config,
+                        continuation_mode=continuation_mode,
+                    )
+                    if score > chosen_score or (abs(score - chosen_score) < 1e-6 and (chosen_end is None or end > chosen_end)):
+                        chosen_end = end
+                        chosen_score = score
 
             if chosen_end is None:
                 chosen_end = source_target_end if source_target_end > start else best_end
@@ -1439,7 +1615,7 @@ class TranslationAgentNoIsoLength:
         pbar = tqdm(sorted_lids, desc="Translating (No IsoLength)", unit="block")
         for lid in pbar:
             group = groups[lid]
-            group.sort(key=lambda x: (x['item']['page_idx'], x['item']['bbox'][1]))
+            group = self._sort_group_in_reading_order(group)
             if data[group[0]['index']].get('translated'): 
                 continue
             first_item = group[0]['item']

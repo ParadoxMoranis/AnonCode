@@ -229,6 +229,69 @@ class TranslationAgent:
         self._font_size_cache = {}
         self._split_layout_tool = None
 
+    def _safe_bbox(self, item: Dict) -> List[float]:
+        bbox = item.get('bbox', [0, 0, 0, 0]) or [0, 0, 0, 0]
+        if len(bbox) != 4:
+            return [0, 0, 0, 0]
+        return [float(v) for v in bbox]
+
+    def _sort_group_in_reading_order(self, group: List[Dict]) -> List[Dict]:
+        if len(group) <= 1:
+            return group
+
+        grouped_by_page: Dict[int, List[Dict]] = {}
+        for entry in group:
+            item = entry['item']
+            page_idx = int(item.get('page_idx', 0) or 0)
+            grouped_by_page.setdefault(page_idx, []).append(entry)
+
+        ordered: List[Dict] = []
+        for page_idx in sorted(grouped_by_page):
+            page_group = grouped_by_page[page_idx]
+            if len(page_group) <= 1:
+                ordered.extend(page_group)
+                continue
+
+            bboxes = [self._safe_bbox(entry['item']) for entry in page_group]
+            min_x = min(b[0] for b in bboxes)
+            max_x = max(b[2] for b in bboxes)
+            page_span = max(1.0, max_x - min_x)
+            centers = sorted((b[0] + b[2]) / 2.0 for b in bboxes)
+            widths = [max(1.0, b[2] - b[0]) for b in bboxes]
+            two_column_like = (
+                len(page_group) >= 2
+                and sum(1 for width in widths if width <= page_span * 0.72) >= 2
+                and (centers[-1] - centers[0]) >= page_span * 0.22
+            )
+
+            if not two_column_like:
+                ordered.extend(
+                    sorted(
+                        page_group,
+                        key=lambda entry: (
+                            self._safe_bbox(entry['item'])[1],
+                            self._safe_bbox(entry['item'])[0],
+                        ),
+                    )
+                )
+                continue
+
+            split_x = sum(centers) / len(centers)
+
+            def sort_key(entry: Dict):
+                bbox = self._safe_bbox(entry['item'])
+                width = max(1.0, bbox[2] - bbox[0])
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                spans_both_cols = width >= page_span * 0.78
+                if spans_both_cols:
+                    return (-1, bbox[1], bbox[0])
+                col = 0 if center_x <= split_x else 1
+                return (col, bbox[1], bbox[0])
+
+            ordered.extend(sorted(page_group, key=sort_key))
+
+        return ordered
+
     REFERENCE_HEADINGS = {
         'references', 'reference', 'bibliography', 'works cited'
     }
@@ -411,7 +474,7 @@ class TranslationAgent:
         ordered_entries = []
         for lid in sorted_lids:
             group = groups[lid]
-            group.sort(key=lambda x: (x['item']['page_idx'], x['item']['bbox'][1]))
+            group = self._sort_group_in_reading_order(group)
             first_item = group[0]['item']
             raw_text = first_item.get('context') or " ".join(g['item'].get('text', '') for g in group)
             corrected_type = self._correct_element_type_visually(first_item, body_base_size, doc)
@@ -459,30 +522,9 @@ class TranslationAgent:
             if self._is_reference_heading(stripped_text):
                 in_reference_section = True
                 preserve = True
-            elif corrected_type == 'reference' or 'reference' in raw_type:
-                preserve = True
-                if page_idx >= late_page_threshold and (
-                    strong_reference or weak_reference or len(stripped_text) <= 32
-                ):
-                    in_reference_section = True
-            elif strong_reference and (
-                in_reference_section
-                or page_idx >= late_page_threshold
-                or corrected_type in {'footnote', 'footer', 'header'}
-            ):
+            elif 'reference' in raw_type:
                 preserve = True
                 in_reference_section = True
-            elif in_reference_section and (weak_reference or fragment_reference):
-                preserve = True
-            elif in_reference_section and corrected_type in {'text', 'footnote'} and (
-                fragment_reference
-                or (
-                    len(stripped_text) >= 20
-                    and re.search(r'\b(?:19|20)\d{2}[a-z]?\b', stripped_text)
-                    and (',' in stripped_text or '&' in stripped_text)
-                )
-            ):
-                preserve = True
 
             if preserve and group:
                 for g in group:
@@ -491,7 +533,7 @@ class TranslationAgent:
     def _should_preserve_original_group(self, corrected_type: str, raw_text: str, group: List[Dict]) -> bool:
         if self._is_reference_heading(raw_text):
             return True
-        if corrected_type == 'reference':
+        if any('reference' in (g['item'].get('type', '').lower()) for g in group):
             return True
         return any(g['item'].get('_preserve_reference') for g in group)
 
@@ -615,23 +657,33 @@ class TranslationAgent:
                 math_like_count += 1
         math_like_ratio = math_like_count / max(1, len(body_items))
 
-        target_line = 1.5
-        target_natural_fill = 0.91
+        target_line = 1.46
+        target_natural_fill = 0.986
 
         if avg_width_ratio < 0.78:
-            target_line -= 0.05
-        if avg_src_density >= 80:
             target_line -= 0.03
-            target_natural_fill += 0.01
-        if math_like_ratio >= 0.10:
+            target_natural_fill += 0.008
+        if avg_src_density <= 62:
             target_line -= 0.02
-            target_natural_fill -= 0.01
+            target_natural_fill += 0.012
+        if avg_src_density <= 52:
+            target_line -= 0.02
+            target_natural_fill += 0.014
+        if avg_src_density <= 44:
+            target_line -= 0.02
+            target_natural_fill += 0.014
+        if avg_src_density >= 80:
+            target_line -= 0.02
+            target_natural_fill += 0.015
+        if math_like_ratio >= 0.10:
+            target_line -= 0.01
+            target_natural_fill -= 0.004
         if avg_width_ratio >= 0.84 and avg_src_density <= 70 and math_like_ratio <= 0.05:
-            target_line += 0.03
-            target_natural_fill += 0.01
+            target_line += 0.01
+            target_natural_fill += 0.014
 
-        target_line = round(max(1.4, min(1.55, target_line)) * 20) / 20
-        target_natural_fill = max(0.88, min(0.93, target_natural_fill))
+        target_line = round(max(1.34, min(1.50, target_line)) * 20) / 20
+        target_natural_fill = max(0.968, min(0.996, target_natural_fill))
         return target_line, target_natural_fill
 
     def _clean_hallucinations(self, text: str) -> str:
@@ -1061,17 +1113,17 @@ class TranslationAgent:
             if self.layout_mode == "single_col":
                 target_line, target_natural_fill = self._estimate_single_col_body_targets(body_items, page_width, avg_src_density)
             else:
-                target_line, target_natural_fill = 1.35, 0.80
+                target_line, target_natural_fill = 1.32, 0.952
             natural_fill = (0.6 * (orig_body_size**2) * target_line * 1.1) / avg_src_density
             
             upscale_factor = 1.0
             if natural_fill < target_natural_fill:
-                upscale_factor = min((target_natural_fill / natural_fill) ** 0.5, 1.4 if self.layout_mode == "single_col" else 1.3)
-            
-            golden_body_size = max(9.0, min(12.0, orig_body_size * upscale_factor))
-            styles['body'] = {'size': round(golden_body_size*2)/2, 'line': target_line, 'char': 0.05, 'font_key': 'body'}
+                upscale_factor = min((target_natural_fill / natural_fill) ** 0.5, 1.72 if self.layout_mode == "single_col" else 1.58)
+
+            golden_body_size = max(10.0, min(13.5, orig_body_size * upscale_factor))
+            styles['body'] = {'size': round(golden_body_size*2)/2, 'line': target_line, 'char': 0.04, 'font_key': 'body'}
         else:
-            styles['body'] = {'size': 10.5, 'line': 1.4, 'char': 0.05, 'font_key': 'body'}
+            styles['body'] = {'size': 11.4, 'line': 1.40, 'char': 0.04, 'font_key': 'body'}
             orig_body_size = 9.0
             upscale_factor = 1.0
 
@@ -1473,15 +1525,9 @@ class TranslationAgent:
         if any(t in corrected_type for t in self.NO_EXPANSION_TYPES):
             can_expand = False
         
-        # [V3 核心] 标题：严格直译，禁止扩写，不加量词
+        # M0 只做普通翻译，不向 LLM 暴露任何目标字数信息。
         if is_title_type:
-            # 标题最大长度 = 原文长度 * 0.6（中文更短）
-            max_title_chars = max(3, int(len(raw_text) * 0.6))
-            
-            # 计算标题中的占位符数量
             title_mask_count = len(re.findall(r'\[MATH_MASK_\d+\]', masked_text))
-            
-            # [V9 修复] 只有当标题有占位符时才提及占位符
             if title_mask_count > 0:
                 prompt = (
                     f"Translate to Chinese: {masked_text}\n\n"
@@ -1490,7 +1536,7 @@ class TranslationAgent:
                     f"2. Preserve {title_mask_count} [MATH_MASK_X] placeholders exactly.\n"
                     f"3. Keep section numbers unchanged.\n"
                     f"4. No extra words after numbers (✓'4 结果' ✗'4项结果').\n"
-                    f"5. Maximum {max_title_chars} characters.\n"
+                    f"5. Keep the title natural and concise.\n"
                     f"6. Output format: <translation text only>\n"
                 )
             else:
@@ -1500,7 +1546,7 @@ class TranslationAgent:
                     f"1. Output ONLY the translation - no other text.\n"
                     f"2. Keep section numbers unchanged.\n"
                     f"3. No extra words after numbers (✓'4 结果' ✗'4项结果').\n"
-                    f"4. Maximum {max_title_chars} characters.\n"
+                    f"4. Keep the title natural and concise.\n"
                     f"5. Output format: <translation text only>\n"
                 )
             msgs = [{"role": "user", "content": prompt}]
@@ -1515,12 +1561,7 @@ class TranslationAgent:
             if title_mask_count > 0 and title_mask_after != title_mask_count:
                 print(f"    ❌ [Title Placeholder Fatal] {title_mask_count} → {title_mask_after}, using ORIGINAL")
                 trans_masked = masked_text
-            
-            # [V3] 严格限制：如果翻译超过原文长度，强制截断
-            if len(trans_masked) > len(raw_text):
-                print(f"    ⚠️ Title too long ({len(trans_masked)} > {len(raw_text)}), truncating...")
-                trans_masked = trans_masked[:max_title_chars]
-            
+
             # [V3] 标题使用 rich_spans 中的原始字号
             if group_style_infos and group_style_infos[0].get('original_size'):
                 config['size'] = group_style_infos[0]['original_size']
@@ -1529,64 +1570,14 @@ class TranslationAgent:
                 if max_size > config.get('size', 10):
                     config['size'] = max_size
         else:
-            # 非标题类型：执行定长翻译逻辑
-            all_bboxes = [g['item']['bbox'] for g in group]
-            
-            # [V6 重构] 基于高度的视觉填充率计算
-            total_bbox_height = sum([b[3] - b[1] for b in all_bboxes])
-            avg_bbox_width = sum([b[2] - b[0] for b in all_bboxes]) / len(all_bboxes) if all_bboxes else 200
-            
-            # 目标字符数（用于提示 LLM）
-            total_target_chars = sum([self._calculate_target_chars(b, config) for b in all_bboxes])
-            
-            # [V3] 目标填充率：95%-110%
-            target_fill_min = 0.95
-            target_fill_max = 1.10  # 允许 10% 溢出
-            
-            est_raw_len = len(raw_text) * 0.6  # 中文约为英文的 60%
-            
-            # [V6] 使用高度模拟预估填充率
-            est_trans_text = "中" * int(est_raw_len)  # 模拟译文
-            est_height = self._simulate_text_height(est_trans_text, avg_bbox_width, config)
-            est_fill_ratio = est_height / total_bbox_height if total_bbox_height > 0 else 1.0
-            
-            # [核心修复] 带重试的翻译逻辑
-            MAX_RETRIES = 3  # 增加重试次数以处理占位符问题
+            # 非标题类型：M0 仅执行普通翻译，不做定长控制。
+            MAX_RETRIES = 3
             trans_masked = ""
-            best_result = ""
-            best_fill_ratio = 0
-            placeholder_valid = False  # 跟踪占位符是否完整
-            
             for attempt in range(MAX_RETRIES + 1):
-                if attempt == 0:
-                    if not can_expand:
-                        strategy = "Strategy: ACCURATE. Do NOT expand. Concise."
-                    else:
-                        # [V3] 95%-110% 填充目标
-                        if est_fill_ratio > 1.15:
-                            strategy = f"Target ~{total_target_chars} chars. Strategy: Be CONCISE but keep key information."
-                        elif est_fill_ratio < 0.90:
-                            # 填充不足 90%，适度扩写
-                            ratio = 0.98 / est_fill_ratio if est_fill_ratio > 0 else 1.3
-                            strategy = (
-                                f"Target ~{total_target_chars} chars (Expand ~{ratio:.1f}x).\n"
-                                "Strategy: Add some academic details to fill space."
-                            )
-                        else:
-                            strategy = "Strategy: ACCURATE. Natural translation flow."
-                else:
-                    # [V3] 重试时要求达到 95% 填充
-                    target_95 = int(total_target_chars * 0.98)
-                    if best_fill_ratio < target_fill_min:
-                        strategy = (
-                            f"**LENGTH CONTROL**: Output should be approximately {target_95} Chinese characters.\n"
-                            f"Current output is too short (fill ratio: {best_fill_ratio:.0%}). Target: 95%-110%.\n"
-                            "Strategy: Add some details to better fill the text box."
-                        )
-                    else:
-                        break
+                strategy = "Accurate and natural translation."
+                if not can_expand:
+                    strategy = "Accurate and concise translation. Do not expand the content."
 
-                # [V9 修复] 只有当原文有占位符时才提及占位符要求
                 if mask_count_before > 0:
                     prompt = (
                         f"Translate to Chinese: {masked_text}\n\n"
@@ -1630,24 +1621,9 @@ class TranslationAgent:
                         continue  # 强制重试
                     else:
                         print(f"    ❌ [Placeholder Fatal] Max retries reached, accepting incomplete result")
-                
-                actual_height = self._simulate_text_height(trans_masked, avg_bbox_width, config)
-                actual_fill_ratio = actual_height / total_bbox_height if total_bbox_height > 0 else 1.0
-                
-                # 只有占位符完整时才更新最佳结果
-                if placeholder_valid and actual_fill_ratio > best_fill_ratio:
-                    best_result = trans_masked
-                    best_fill_ratio = actual_fill_ratio
-                
-                # 只有占位符完整且填充率合适时才提前退出
-                if placeholder_valid and target_fill_min <= actual_fill_ratio <= target_fill_max:
+                if placeholder_valid:
                     break
-                
-                if not can_expand or attempt >= MAX_RETRIES:
-                    break
-            
-            trans_masked = best_result if best_result else trans_masked
-            
+
             # [V9 严格检查] 如果占位符数量不匹配，使用原文（不翻译）
             if trans_masked:
                 final_mask_count = len(re.findall(r'\[MATH_MASK_\d+\]', trans_masked))
@@ -1791,7 +1767,7 @@ class TranslationAgent:
         self._annotate_reference_sections(groups, sorted_lids, body_base_size, doc, data=data)
         pbar = tqdm(sorted_lids, desc="Translating", unit="block")
         for lid in pbar:
-            group = groups[lid]; group.sort(key=lambda x: (x['item']['page_idx'], x['item']['bbox'][1]))
+            group = self._sort_group_in_reading_order(groups[lid])
             if data[group[0]['index']].get('translated'): continue
             first_item = group[0]['item']; raw_type = first_item.get('type','').lower()
             if any(t in raw_type for t in self.SKIP_TEXT_TYPES):

@@ -53,27 +53,45 @@ class PlannerAgent:
         "footer": "footer",
     }
 
+    REWRITE_PRESERVE_TYPES = {
+        "reference",
+        "equation",
+        "code",
+        "url",
+        "page_header",
+        "page_footer",
+        "aside_text",
+        "page_number",
+        "author",
+        "affiliation",
+    }
+
     DEFAULT_STYLE_POLICY = {
         "lock_font_size": True,
+        "lock_line_spacing": True,
         "char_spacing_abs_min": 0.0,
-        "char_spacing_abs_max": 0.14,
-        "char_spacing_max_global_spread": 0.05,
-        "char_spacing_max_delta_from_bucket": 0.025,
-        "body_probe_safe_fill": 0.92,
-        "dense_body_probe_safe_fill": 0.88,
-        "other_probe_safe_fill": 0.94,
+        "char_spacing_abs_max": 0.2,
+        "char_spacing_max_global_spread": 0.06,
+        "char_spacing_max_delta_from_bucket": 0.035,
+        "line_spacing_abs_min": 1.15,
+        "line_spacing_abs_max": 1.55,
+        "line_spacing_max_delta_from_bucket": 0.05,
+        "body_probe_safe_fill": 0.974,
+        "dense_body_probe_safe_fill": 0.952,
+        "other_probe_safe_fill": 0.978,
         "dense_probe_safe_box_ratio": 0.90,
-        "body_probe_safe_box_ratio": 0.92,
-        "other_probe_safe_box_ratio": 0.96,
+        "body_probe_safe_box_ratio": 0.962,
+        "other_probe_safe_box_ratio": 0.986,
         "body_freeze_quantile": 0.25,
         "body_freeze_quantile_spread1": 0.2,
         "body_freeze_quantile_spread2": 0.15,
-        "rewrite_conservative_doc_math_ratio": 0.18,
-        "rewrite_disable_doc_math_ratio": 0.32,
-        "rewrite_disable_doc_multibox_ratio": 0.12,
-        "rewrite_disable_safe_body_ratio": 0.12,
-        "rewrite_disable_safe_body_min_blocks": 12,
-        "rewrite_block_max_chars": 220,
+        "rewrite_conservative_doc_math_ratio": 0.32,
+        "rewrite_disable_doc_math_ratio": 0.48,
+        "rewrite_disable_doc_multibox_ratio": 0.22,
+        "rewrite_disable_safe_body_ratio": 0.08,
+        "rewrite_disable_safe_body_min_blocks": 8,
+        "rewrite_block_max_chars": 360,
+        "safe_prose_rewrite_min_chars": 20,
     }
 
     def __init__(self, target_lang: str = "zh", style_policy: Optional[Dict] = None):
@@ -205,10 +223,6 @@ class PlannerAgent:
             if probe.get("line") is not None:
                 bucket_probes[bucket]["line"].append(probe["line"])
                 block_probe_values[str(lid)]["line"].append(probe["line"])
-            if probe.get("char") is not None:
-                bucket_probes[bucket]["char"].append(probe["char"])
-                block_probe_values[str(lid)]["char"].append(probe["char"])
-
         frozen_bucket_styles = self._freeze_bucket_styles(bucket_probes)
         initial_styles = deepcopy(
             self.global_plan.get("initial_golden_styles")
@@ -216,7 +230,7 @@ class PlannerAgent:
             or {}
         )
         frozen_styles = self._apply_frozen_bucket_styles(initial_styles, frozen_bucket_styles)
-        char_guardrails = self._build_char_spacing_guardrails(frozen_bucket_styles)
+        char_guardrails = self._build_char_spacing_guardrails(frozen_bucket_styles, fallback_styles=frozen_styles)
         frozen_styles = self._clamp_frozen_style_chars(frozen_styles, char_guardrails)
 
         for item in data:
@@ -230,8 +244,8 @@ class PlannerAgent:
                 frozen_style["size"] = bucket_style["size"]
             if bucket_style.get("line") is not None:
                 frozen_style["line"] = bucket_style["line"]
-            if bucket_style.get("char") is not None:
-                frozen_style["char"] = self._clamp_char_with_guardrails(bucket_style["char"], char_guardrails)
+            if frozen_style.get("char") is not None:
+                frozen_style["char"] = self._clamp_char_with_guardrails(frozen_style["char"], char_guardrails)
             item["pre_m0_golden_style"] = deepcopy(golden_style)
             item["golden_style"] = frozen_style
             item["m0_frozen_style"] = deepcopy(frozen_style)
@@ -447,7 +461,7 @@ class PlannerAgent:
             return {
                 "decision": "micro_tune",
                 "rewrite_mode": None,
-                "actions": ["FontSize"],
+                "actions": ["CharSpacing"],
             }
 
         if issue == "OVERFLOW":
@@ -455,20 +469,20 @@ class PlannerAgent:
                 return {
                     "decision": "force_fit",
                     "rewrite_mode": None,
-                    "actions": ["FontSize", "LineSpacing"],
+                    "actions": ["CharSpacing"],
                 }
             return {
                 "decision": "rewrite_and_tune",
                 "rewrite_mode": "shorten",
-                "actions": ["Rewriting", "LineSpacing", "CharSpacing", "FontSize"],
+                "actions": ["Rewriting", "CharSpacing"],
                 "overflow_px": overflow_px,
             }
 
         if issue == "UNDERFLOW":
             return {
-                "decision": "rewrite",
+                "decision": "rewrite_and_tune",
                 "rewrite_mode": "lengthen",
-                "actions": ["Rewriting"],
+                "actions": ["Rewriting", "CharSpacing"],
             }
 
         return {"decision": "observe", "rewrite_mode": None, "actions": []}
@@ -765,6 +779,40 @@ class PlannerAgent:
             return 0
         return len(re.findall(r"\\[A-Za-z]+", text))
 
+    def _is_text_like_segment(self, item: Dict) -> bool:
+        raw_type = (item.get("type") or "").lower()
+        detected_type = (item.get("detected_type") or raw_type).lower()
+        if any(token in raw_type or token in detected_type for token in self.REWRITE_PRESERVE_TYPES):
+            return False
+        text_like_raw = {"", "text", "abstract", "paragraph"}
+        text_like_detected = {"", "text", "body", "paragraph", "abstract"}
+        return raw_type in text_like_raw and detected_type in text_like_detected
+
+    def _is_safe_multibox_body_candidate(
+        self,
+        items: List[Dict],
+        bucket: str,
+        compact_text: str,
+        math_segments: int,
+        latex_commands: int,
+        theorem_like: bool,
+        compact_box: bool,
+    ) -> bool:
+        min_chars = int(self.style_policy.get("safe_prose_rewrite_min_chars", 60))
+        if (
+            bucket != "body"
+            or len(items) <= 1
+            or len(compact_text) < min_chars
+            or math_segments != 0
+            or latex_commands != 0
+            or theorem_like
+            or compact_box
+        ):
+            return False
+        if len(items) > 3:
+            return False
+        return all(self._is_text_like_segment(item) for item in items)
+
     def _theorem_like_text(self, text: str) -> bool:
         if not text:
             return False
@@ -812,14 +860,15 @@ class PlannerAgent:
                 math_like_blocks += 1
             if theorem_like:
                 theorem_like_blocks += 1
-            if (
-                text_like
-                and len(items) == 1
-                and len(compact_text) >= 80
-                and math_segments == 0
-                and latex_commands == 0
-                and not theorem_like
-                and not compact_box
+            if self._is_safe_prose_body_candidate(
+                bucket="body" if text_like else "",
+                compact_text=compact_text,
+                math_segments=math_segments,
+                latex_commands=latex_commands,
+                theorem_like=theorem_like,
+                multi_box=len(items) > 1,
+                compact_box=compact_box,
+                items=items,
             ):
                 safe_body_blocks += 1
 
@@ -888,6 +937,7 @@ class PlannerAgent:
             text = first.get("context") or " ".join((item.get("text") or "") for item in items)
             compact_text = re.sub(r"\s+", "", text or "")
             raw_type = (first.get("type") or "").lower()
+            detected_type = (first.get("detected_type") or raw_type).lower()
             bucket = self._resolve_bucket(first, first.get("golden_style"))
             block_info = self.block_states.setdefault(
                 key,
@@ -902,10 +952,31 @@ class PlannerAgent:
             multi_box = len(items) > 1
             compact_box = box_height > 0 and box_height <= 22
             long_text = len(compact_text) >= int(self.style_policy.get("rewrite_block_max_chars", 220))
+            safe_prose_body = self._is_safe_prose_body_candidate(
+                bucket=bucket,
+                compact_text=compact_text,
+                math_segments=math_segments,
+                latex_commands=latex_commands,
+                theorem_like=theorem_like,
+                multi_box=multi_box,
+                compact_box=compact_box,
+                items=items,
+            )
+            safe_multibox_body = multi_box and self._is_safe_multibox_body_candidate(
+                items=items,
+                bucket=bucket,
+                compact_text=compact_text,
+                math_segments=math_segments,
+                latex_commands=latex_commands,
+                theorem_like=theorem_like,
+                compact_box=compact_box,
+            )
 
             risk_flags = []
             if multi_box:
                 risk_flags.append("multi_box")
+            if safe_multibox_body:
+                risk_flags.append("safe_multibox_body")
             if math_segments > 0:
                 risk_flags.append("contains_math")
             if latex_commands > 0:
@@ -916,20 +987,21 @@ class PlannerAgent:
                 risk_flags.append("compact_box")
             if long_text:
                 risk_flags.append("long_text")
+            if safe_prose_body:
+                risk_flags.append("safe_prose_body")
             if bucket in {"title", "section_header", "caption", "footnote", "header", "footer"}:
                 risk_flags.append(f"bucket_{bucket}")
             if raw_type in {"aside_text", "page_number"}:
                 risk_flags.append(f"type_{raw_type}")
 
-            rewrite_allowed = bucket == "body"
+            rewrite_allowed = self._is_rewrite_candidate_block(bucket, raw_type, detected_type)
+            high_risk_rewrite = multi_box or math_segments > 0 or latex_commands > 0 or theorem_like or compact_box
             if disable_global_rewrite:
-                rewrite_allowed = False
                 risk_flags.append("doc_global_rewrite_disabled")
-            elif conservative_mode and (multi_box or math_segments > 0 or latex_commands > 0 or theorem_like or compact_box):
-                rewrite_allowed = False
+                if safe_prose_body:
+                    risk_flags.append("safe_prose_rewrite_override")
+            if conservative_mode and high_risk_rewrite:
                 risk_flags.append("doc_conservative_mode")
-            elif multi_box or math_segments > 0 or latex_commands > 0 or theorem_like or compact_box:
-                rewrite_allowed = False
 
             risk_level = "low"
             if any(flag in risk_flags for flag in ("contains_math", "contains_latex_commands", "theorem_like", "multi_box")):
@@ -949,6 +1021,10 @@ class PlannerAgent:
                     "compact_box": compact_box,
                     "long_text": long_text,
                     "theorem_like": theorem_like,
+                    "safe_prose_rewrite": safe_prose_body,
+                    "safe_multibox_body": safe_multibox_body,
+                    "multi_box_segment_count": len(items),
+                    "detected_type": detected_type,
                 }
             )
             rewrite_counts["allowed" if rewrite_allowed else "blocked"] += 1
@@ -960,6 +1036,48 @@ class PlannerAgent:
                 "rewrite_blocked_blocks": rewrite_counts.get("blocked", 0),
             }
         )
+
+    def _is_safe_prose_body_candidate(
+        self,
+        bucket: str,
+        compact_text: str,
+        math_segments: int,
+        latex_commands: int,
+        theorem_like: bool,
+        multi_box: bool,
+        compact_box: bool,
+        items: List[Dict] = None,
+    ) -> bool:
+        min_chars = int(self.style_policy.get("safe_prose_rewrite_min_chars", 60))
+        if (
+            bucket == "body"
+            and len(compact_text) >= min_chars
+            and math_segments == 0
+            and latex_commands == 0
+            and not theorem_like
+            and not compact_box
+        ):
+            if not multi_box:
+                return True
+            return self._is_safe_multibox_body_candidate(
+                items=items or [],
+                bucket=bucket,
+                compact_text=compact_text,
+                math_segments=math_segments,
+                latex_commands=latex_commands,
+                theorem_like=theorem_like,
+                compact_box=compact_box,
+            )
+        return False
+
+    def _is_rewrite_candidate_block(self, bucket: str, raw_type: str, detected_type: str) -> bool:
+        raw = (raw_type or "").lower()
+        detected = (detected_type or raw).lower()
+        if any(token in raw or token in detected for token in self.REWRITE_PRESERVE_TYPES):
+            return False
+        if bucket in {"title", "section_header", "header", "footer"}:
+            return False
+        return True
 
     def _is_dense_probe_block(
         self,
@@ -1136,7 +1254,19 @@ class PlannerAgent:
                 if is_dense
                 else self.style_policy["body_probe_safe_fill"]
             )
-            return max(configured, 0.88 if is_dense else 0.92)
+            target = max(configured, 0.90 if is_dense else 0.94)
+            density = float(self.document_profile.get("median_source_density", 0.0) or 0.0)
+            if density and density <= 58.0:
+                target += 0.008
+            if density and density <= 50.0:
+                target += 0.01
+            if density and density <= 42.0:
+                target += 0.008
+            if self.document_profile.get("layout_mode", "single_col") == "double_col":
+                target += 0.004
+            if self.document_profile.get("avg_text_length", 0.0) >= 320.0:
+                target += 0.004
+            return min(0.992, target)
 
         target_map = {
             "title": 0.86,
@@ -1258,12 +1388,22 @@ class PlannerAgent:
         candidates.add(self._round_to_step(min(abs_max, max(abs_min, base_char + delta + 0.005)), 0.005))
         return sorted(candidates)
 
-    def _build_char_spacing_guardrails(self, frozen_bucket_styles: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    def _build_char_spacing_guardrails(
+        self,
+        frozen_bucket_styles: Dict[str, Dict[str, float]],
+        fallback_styles: Optional[Dict] = None,
+    ) -> Dict[str, float]:
         chars = [
             style["char"]
             for style in frozen_bucket_styles.values()
             if isinstance(style, dict) and style.get("char") is not None
         ]
+        if not chars and fallback_styles:
+            chars = [
+                style.get("char")
+                for style in fallback_styles.values()
+                if isinstance(style, dict) and style.get("char") is not None
+            ]
         abs_min = self.style_policy["char_spacing_abs_min"]
         abs_max = self.style_policy["char_spacing_abs_max"]
         max_spread = self.style_policy["char_spacing_max_global_spread"]

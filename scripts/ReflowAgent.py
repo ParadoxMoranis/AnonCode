@@ -17,7 +17,7 @@ class ReflowAgent:
         self.tool = PDFReflowTool(lang=target_lang)
         self.operation_policy = operation_policy or {
             'allow_rewriting': True,
-            'allow_line_spacing': True,
+            'allow_line_spacing': False,
             'allow_char_spacing': True,
             'allow_font_size': True,
         }
@@ -39,6 +39,18 @@ class ReflowAgent:
         self._style_align_cache = {}
         if self._is_font_size_locked():
             self.operation_policy['allow_font_size'] = False
+
+    def _sanitize_render_text(self, item: Dict, text: str) -> str:
+        cleaned = text or ''
+        raw_type = (item.get('type') or '').lower()
+        detected_type = (item.get('detected_type') or '').lower()
+        footer_like = any(
+            token in raw_type or token in detected_type
+            for token in ('footer', 'footnote', 'page_footnote')
+        )
+        if footer_like:
+            cleaned = re.sub(r'^[\s\u2020\u2021\u00a7\u00b6\u2016]+', '', cleaned)
+        return cleaned
 
     def _matches_preserve_type(self, raw_type: str, detected_type: str = '') -> bool:
         raw = (raw_type or '').lower()
@@ -93,55 +105,234 @@ class ReflowAgent:
             and avg_text_length >= 380.0
         )
 
-    def _underflow_threshold(self, font_key: str = '', is_title: bool = False) -> float:
+    def _block_meta(self, lid) -> Dict:
+        if not self.planner or lid is None:
+            return {}
+        return self.planner.block_states.get(str(lid), {}).get('meta', {}) or {}
+
+    def _is_safe_prose_rewrite_block(self, lid) -> bool:
+        return bool(self._block_meta(lid).get('safe_prose_rewrite', False))
+
+    def _is_fragile_metadata_block(self, item: Dict = None, lid=None, font_key: str = '', detected_type: str = '') -> bool:
+        meta = self._block_meta(lid)
+        page_idx = meta.get('page_idx', item.get('page_idx', 0) if item else 0)
+        compact_box = bool(meta.get('compact_box', False))
+        multi_box = bool(meta.get('multi_box', False))
+        if font_key and font_key != 'body':
+            return False
+        if page_idx != 0 or not compact_box or multi_box:
+            return False
+        bbox = (item or {}).get('bbox') or []
+        box_bottom = float(bbox[3]) if len(bbox) == 4 else 0.0
+        box_height = self._bbox_height(bbox) if len(bbox) == 4 else 0.0
+        text = ((item or {}).get('translated') or (item or {}).get('text') or '').strip()
+        compact_chars = len(text.replace(' ', '').replace('\n', ''))
+        detected = (detected_type or meta.get('detected_type') or (item or {}).get('type') or '').lower()
+        if 'title' in detected or 'section_header' in detected:
+            return False
+        return box_bottom <= 200.0 and box_height <= 18.0 and compact_chars <= 48
+
+    def _is_fragile_multibox_underflow_block(self, lid=None, font_key: str = '') -> bool:
+        if font_key and font_key != 'body':
+            return False
+        meta = self._block_meta(lid)
+        return bool(meta.get('multi_box', False)) and not bool(meta.get('safe_prose_rewrite', False))
+
+    def _bbox_height(self, bbox: List[float]) -> float:
+        if len(bbox) != 4:
+            return 0.0
+        return max(0.0, float(bbox[3]) - float(bbox[1]))
+
+    def _is_severe_underflow(
+        self,
+        fill_ratio: float,
+        threshold: float,
+        bbox: List[float],
+        font_key: str = '',
+        lid=None,
+    ) -> bool:
+        if font_key != 'body':
+            return False
+        box_height = self._bbox_height(bbox)
+        if self._layout_mode() == 'single_col':
+            if fill_ratio < 0.70:
+                return True
+            if fill_ratio < max(0.01, threshold - 0.16):
+                return True
+            if box_height >= 96 and fill_ratio < 0.80:
+                return True
+            if self._is_safe_prose_rewrite_block(lid) and fill_ratio < 0.82:
+                return True
+            return False
+        if self._layout_mode() == 'double_col':
+            if fill_ratio < 0.74:
+                return True
+            if fill_ratio < max(0.01, threshold - 0.14):
+                return True
+            if box_height >= 72 and fill_ratio < 0.81:
+                return True
+            if self._is_safe_prose_rewrite_block(lid) and fill_ratio < 0.83:
+                return True
+            return False
+        return fill_ratio < 0.68
+
+    def _get_line_spacing_guardrails(self, base_line: float, font_key: str = '') -> Dict[str, float]:
+        abs_min = 1.15
+        abs_max = 1.55
+        if self.planner:
+            abs_min = float(self.planner.style_policy.get('line_spacing_abs_min', abs_min))
+            abs_max = float(self.planner.style_policy.get('line_spacing_abs_max', abs_max))
+        locked_line = min(abs_max, max(abs_min, base_line))
+        return {
+            'absolute_min': abs_min,
+            'absolute_max': abs_max,
+            'local_min': round(locked_line, 3),
+            'local_max': round(locked_line, 3),
+            'center': round(locked_line, 3),
+            'max_delta_from_bucket': 0.0,
+        }
+
+    def _underflow_threshold(self, font_key: str = '', is_title: bool = False, lid=None) -> float:
         if is_title:
             return 0.66
+        if self._is_fragile_metadata_block(lid=lid, font_key=font_key):
+            return 0.42
+        if self._is_fragile_multibox_underflow_block(lid=lid, font_key=font_key):
+            return 0.88 if self._layout_mode() == 'double_col' else 0.92
         if self._layout_mode() == 'double_col' and font_key == 'body':
-            if self._is_formula_dense_document():
-                return 0.78
-            if self._is_prose_heavy_document():
-                return 0.88
-            return 0.84
+            if self._is_safe_prose_rewrite_block(lid):
+                return 0.992 if self._is_prose_heavy_document() else 0.982
+            return 0.972 if self._is_prose_heavy_document() else 0.952
         if self._layout_mode() == 'double_col':
-            if self._is_formula_dense_document():
-                return 0.74
-            if self._is_prose_heavy_document():
-                return 0.82
-            return 0.78
+            return 0.9 if self._is_prose_heavy_document() else 0.86
         if self._layout_mode() == 'single_col' and font_key == 'body':
-            if self._is_formula_dense_document():
-                return 0.89
-            return 0.92 if self._is_prose_heavy_document() else 0.90
+            if self._is_safe_prose_rewrite_block(lid):
+                return 0.998 if self._is_prose_heavy_document() else 0.988
+            return 0.984 if self._is_prose_heavy_document() else 0.968
         if self._layout_mode() == 'single_col':
-            return 0.82
+            return 0.875
         return 0.68
 
-    def _rewrite_fill_target(self, issue: str, font_key: str = '') -> float:
+    def _rewrite_fill_target(self, issue: str, font_key: str = '', lid=None) -> float:
         layout_mode = self._layout_mode()
         if issue == 'OVERFLOW':
-            return 0.985 if layout_mode == 'single_col' else 0.97
+            return 0.991 if layout_mode == 'single_col' else 0.979
+        if font_key == 'body' and self._is_safe_prose_rewrite_block(lid):
+            return 0.999 if layout_mode == 'single_col' else 0.996
         if layout_mode == 'double_col' and font_key == 'body':
-            return 0.95
+            return 0.993
         if layout_mode == 'double_col':
-            return 0.94
+            return 0.972
         if layout_mode == 'single_col' and font_key == 'body':
-            return 0.985 if not self._is_formula_dense_document() else 0.97
+            return 0.996
         if layout_mode == 'single_col':
-            return 0.95
+            return 0.982
         return 0.92
 
-    def _max_underflow_rewrite_attempts(self, item: Dict, font_key: str = '') -> int:
+    def _max_underflow_rewrite_attempts(
+        self,
+        item: Dict,
+        font_key: str = '',
+        lid=None,
+        current_fill_ratio: float = 1.0,
+        bbox: List[float] = None,
+    ) -> int:
         if font_key != 'body':
             return 1
+        bbox = bbox or item.get('bbox') or []
+        threshold = self._underflow_threshold(font_key, False, lid=lid)
+        severe_underflow = self._is_severe_underflow(current_fill_ratio, threshold, bbox, font_key, lid=lid)
+        if self._is_safe_prose_rewrite_block(lid):
+            if self._layout_mode() == 'single_col':
+                return 5 if severe_underflow else 4
+            return 5 if severe_underflow else 4
         if self._layout_mode() == 'single_col':
             guard = item.get('translation_guard') or {}
             if guard.get('fallback_used'):
                 return 1
             risk_flags = set((self.planner.block_states.get(str(item.get('logical_para_id')), {}).get('meta', {}) or {}).get('risk_flags', [])) if self.planner else set()
+            if severe_underflow:
+                if {'multi_box', 'contains_math', 'contains_latex_commands', 'theorem_like'} & risk_flags:
+                    return 2
+                return 4
             if {'multi_box', 'contains_math', 'contains_latex_commands', 'theorem_like'} & risk_flags:
                 return 1
-            return 2
+            return 3
+        if self._layout_mode() == 'double_col':
+            risk_flags = set((self.planner.block_states.get(str(item.get('logical_para_id')), {}).get('meta', {}) or {}).get('risk_flags', [])) if self.planner else set()
+            if severe_underflow and not ({'multi_box', 'contains_math', 'contains_latex_commands'} & risk_flags):
+                return 4
+            if not ({'multi_box', 'contains_math', 'contains_latex_commands'} & risk_flags):
+                return 3
         return 1
+
+    def _minimum_underflow_growth(
+        self,
+        current_fill_ratio: float,
+        underflow_threshold: float,
+        bbox: List[float],
+        font_key: str = '',
+        lid=None,
+    ) -> float:
+        if font_key != 'body':
+            return 1.0
+        if self._layout_mode() == 'single_col':
+            growth = 1.28 if self._is_safe_prose_rewrite_block(lid) else 1.20
+            if current_fill_ratio < max(0.01, underflow_threshold - 0.05):
+                growth += 0.08
+            if current_fill_ratio < 0.72:
+                growth += 0.14
+            if current_fill_ratio < 0.60:
+                growth += 0.16
+            if self._bbox_height(bbox) >= 96:
+                growth += 0.10
+            return min(1.96, growth)
+        if self._layout_mode() == 'double_col':
+            growth = 1.28 if self._is_safe_prose_rewrite_block(lid) else 1.22
+            if current_fill_ratio < 0.70:
+                growth += 0.16
+            if current_fill_ratio < 0.60:
+                growth += 0.14
+            if self._bbox_height(bbox) >= 72:
+                growth += 0.08
+            return min(1.82, growth)
+        return 1.05
+
+    def _maximum_underflow_growth(
+        self,
+        current_fill_ratio: float,
+        bbox: List[float],
+        font_key: str = '',
+        lid=None,
+    ) -> float:
+        if font_key != 'body':
+            return 1.18
+        risk_flags = set(self._block_meta(lid).get('risk_flags', []))
+        box_height = self._bbox_height(bbox)
+        if self._layout_mode() == 'single_col':
+            if self._is_safe_prose_rewrite_block(lid):
+                cap = 1.88
+            elif {'contains_math', 'contains_latex_commands', 'theorem_like'} & risk_flags:
+                cap = 1.54
+            else:
+                cap = 1.76
+            if current_fill_ratio < 0.60:
+                cap += 0.12
+            elif current_fill_ratio < 0.72:
+                cap += 0.08
+            if box_height >= 96:
+                cap += 0.06
+            return min(2.02, cap)
+        if self._layout_mode() == 'double_col':
+            cap = 1.62
+            if self._is_safe_prose_rewrite_block(lid):
+                cap += 0.1
+            if current_fill_ratio < 0.70:
+                cap += 0.1
+            if box_height >= 72:
+                cap += 0.06
+            return min(1.86, cap)
+        return 1.24
 
     def _math_segment_count(self, text: str) -> int:
         if not text:
@@ -156,11 +347,11 @@ class ReflowAgent:
         if font_key in ('title', 'heading'):
             limit = 0.985
         elif layout_mode == 'single_col' and is_body:
-            limit = 0.965 if self._is_prose_heavy_document() else 0.955
+            limit = 0.99 if self._is_prose_heavy_document() else 0.982
         elif is_body:
-            limit = 0.965 if self._is_prose_heavy_document() else 0.955
+            limit = 0.986 if self._is_prose_heavy_document() else 0.977
         else:
-            limit = 0.97
+            limit = 0.98
 
         compact_chars = len((text or '').replace(' ', '').replace('\n', ''))
         math_segments = self._math_segment_count(text or '')
@@ -171,7 +362,7 @@ class ReflowAgent:
             if box_height <= 18:
                 limit -= 0.02
 
-        return max(0.84, min(0.985, limit))
+        return max(0.89, min(0.994, limit))
 
     def _candidate_fill_score(self, metrics: Dict, target_fill: float, safe_fill_limit: float) -> float:
         fill_ratio = float(metrics.get('fill_ratio', 0.0))
@@ -179,7 +370,7 @@ class ReflowAgent:
             return -1e9
         bonus = min(fill_ratio, safe_fill_limit)
         closeness = max(0.0, 1.0 - abs(target_fill - fill_ratio) * 8.0)
-        return bonus * 1000.0 + closeness * 25.0
+        return bonus * 1000.0 + closeness * 100.0
 
     def _rewrite_allowed_for_block(self, item: Dict, lid, text: str, font_key: str, detected_type: str = '') -> bool:
         if not self.operation_policy.get('allow_rewriting', True):
@@ -197,6 +388,8 @@ class ReflowAgent:
             return False
         if font_key in ('title', 'heading') or 'title' in detected or 'section_header' in detected:
             return False
+        if self._is_fragile_metadata_block(item=item, lid=lid, font_key=font_key, detected_type=detected):
+            return False
         return True
 
     def _apply_force_fit_without_font_change(self, final_style: Dict, golden_style: Dict, overflow_px: float) -> Tuple[Dict, bool, List[str], str]:
@@ -204,20 +397,20 @@ class ReflowAgent:
             return final_style, True, [], 'accept_minor_overflow'
 
         adjusted_style = final_style.copy()
-        adjusted_style['line'] = max(1.15, adjusted_style['line'] - 0.08)
         adjusted_style['char'] = max(
             self._get_char_spacing_guardrails(golden_style.get('char', 0.05))['global_min'],
             adjusted_style.get('char', golden_style.get('char', 0.05)) - 0.01,
         )
-        return adjusted_style, True, ['LineSpacing', 'CharSpacing'], 'force_fit_without_font_change'
+        adjusted_style['line'] = golden_style.get('line', adjusted_style.get('line', 1.35))
+        return adjusted_style, True, ['CharSpacing'], 'force_fit_without_font_change'
 
     def _get_char_spacing_guardrails(self, base_char: float) -> Dict[str, float]:
         default_center = round(base_char, 3)
         default = {
-            'global_min': max(0.0, default_center - 0.02),
-            'global_max': min(0.12, default_center + 0.02),
+            'global_min': max(0.0, default_center - 0.015),
+            'global_max': min(0.12, default_center + 0.015),
             'center': default_center,
-            'max_delta_from_bucket': 0.02,
+            'max_delta_from_bucket': 0.015,
         }
         if self.planner:
             guardrails = self.planner.global_plan.get('char_spacing_guardrails')
@@ -229,11 +422,13 @@ class ReflowAgent:
 
     def _clamp_style_guardrails(self, style: Dict, base_style: Dict) -> Dict:
         clamped = style.copy()
+        line_guardrails = self._get_line_spacing_guardrails(base_style.get('line', 1.35), base_style.get('font_key', ''))
         guardrails = self._get_char_spacing_guardrails(base_style.get('char', 0.05))
         base_char = float(base_style.get('char', guardrails.get('center', 0.05)))
         max_delta = guardrails.get('max_delta_from_bucket', 0.02)
         local_min = max(guardrails['global_min'], base_char - max_delta)
         local_max = min(guardrails['global_max'], base_char + max_delta)
+        clamped['line'] = line_guardrails['center']
         clamped['char'] = min(local_max, max(local_min, clamped.get('char', base_char)))
         if self._is_font_size_locked():
             clamped['size'] = base_style.get('size', clamped.get('size', 10.5))
@@ -535,33 +730,26 @@ class ReflowAgent:
 
     def _get_micro_tuned_style(self, bbox: List[float], text: str, base_style: Dict) -> Tuple[Dict, str, float]:
         """
-        [V3] 适度调整：行距/字距优先；若黄金字号锁定，则完全禁止缩字号。
+        [V3] 适度调整：锁死黄金行距，只允许同桶小范围字距微调；若黄金字号锁定，则完全禁止缩字号。
         
         核心原则：
         1. 字号只能缩小，最多 -1pt
-        2. 行距/字距 ±5% 调整
+        2. 行距固定，字距仅允许同桶极小偏移
         3. 填充目标 95%-110%
         """
         base_line = base_style.get('line', 1.35)
         base_char = base_style.get('char', 0.05)
         font_size = base_style.get('size', 10.5)
         font_key = base_style.get('font_key', '')
+        line_guardrails = self._get_line_spacing_guardrails(base_line, font_key)
         char_guardrails = self._get_char_spacing_guardrails(base_char)
         safe_fill_limit = self._safe_fill_limit(bbox, text, font_key)
         underfill_target = self._underflow_threshold(font_key, font_key in ('title', 'heading'))
 
-        # [V4] 调整范围：收紧可略更积极，拉伸可明显更积极，但仍受安全上限约束
-        min_line = base_line * 0.93
-        max_line = base_line * 1.08
-        if self._layout_mode() == 'double_col' and font_key == 'body':
-            expand_factor = 1.18 if self._is_formula_dense_document() else (1.28 if self._is_prose_heavy_document() else 1.22)
-        elif self._layout_mode() == 'single_col' and font_key == 'body':
-            expand_factor = 1.14 if self._is_prose_heavy_document() else 1.1
-        else:
-            expand_factor = 1.12
-        expand_line = base_line * expand_factor
-        
-        char_flex = font_size * 0.035
+        # 物理微调严格围绕黄金样式进行，只允许小幅摆动。
+        min_line = line_guardrails['local_min']
+        max_line = line_guardrails['local_max']
+        char_flex = font_size * 0.02
         local_delta = min(char_flex, char_guardrails.get('max_delta_from_bucket', 0.02))
         min_char = max(char_guardrails['global_min'], base_char - local_delta)
         max_char = min(char_guardrails['global_max'], base_char + local_delta)
@@ -585,24 +773,16 @@ class ReflowAgent:
         if (
             not metrics.get('is_overflow', False)
             and fill_ratio < underfill_target
-            and (self.operation_policy.get('allow_line_spacing', True) or self.operation_policy.get('allow_char_spacing', True))
+            and self.operation_policy.get('allow_char_spacing', True)
         ):
             best_style = None
             best_metrics = metrics
             best_score = self._candidate_fill_score(metrics, underfill_target, safe_fill_limit)
             line_candidates = [base_line]
             char_candidates = [base_char]
-            if self.operation_policy.get('allow_line_spacing', True):
-                line_steps = 10 if font_key == 'body' else 7
-                for step in range(1, line_steps + 1):
-                    line_candidates.append(min(expand_line, base_line * (1 + step * 0.02)))
             if self.operation_policy.get('allow_char_spacing', True):
                 char_step = 0.004 if font_key == 'body' else 0.003
-                if self._layout_mode() == 'double_col' and font_key == 'body' and self._is_prose_heavy_document():
-                    char_step = 0.005
-                if self._layout_mode() == 'single_col' and font_key == 'body':
-                    char_step = 0.005
-                char_steps = 10 if (self._layout_mode() == 'single_col' and font_key == 'body') else (8 if font_key == 'body' else 6)
+                char_steps = 8 if font_key == 'body' else 6
                 for step in range(1, char_steps + 1):
                     char_candidates.append(min(max_char, base_char + step * char_step))
 
@@ -620,22 +800,19 @@ class ReflowAgent:
                         best_metrics = expand_metrics
                         best_score = candidate_score
 
-            if best_style is not None and best_metrics.get('fill_ratio', 0.0) > fill_ratio + 0.004:
+            if best_style is not None and best_metrics.get('fill_ratio', 0.0) > fill_ratio + 0.001:
                 return self._clamp_style_guardrails(best_style, base_style), 'tuned_expand', 0.0
 
         # ===== 策略2: 溢出 -> 先调整行距/字距 =====
         # 尝试更细粒度的收紧，并优先选择最接近安全上限的候选
-        if self.operation_policy.get('allow_line_spacing', True) or self.operation_policy.get('allow_char_spacing', True):
+        if self.operation_policy.get('allow_char_spacing', True):
             best_tight = None
             best_tight_score = -1e9
             line_candidates = [base_line]
             char_candidates = [base_char]
-            if self.operation_policy.get('allow_line_spacing', True):
-                for step in range(0, 8):
-                    line_candidates.append(max(min_line, base_line * (1 - step * 0.012)))
             if self.operation_policy.get('allow_char_spacing', True):
-                for step in range(0, 8):
-                    char_candidates.append(max(min_char, base_char - step * 0.005))
+                for step in range(1, 7):
+                    char_candidates.append(max(min_char, base_char - step * 0.003))
 
             for cand_line in sorted(set(line_candidates), reverse=True):
                 for cand_char in sorted(set(char_candidates), reverse=True):
@@ -657,8 +834,7 @@ class ReflowAgent:
             for size_step in [0.3, 0.6, 1.0]:
                 tight_style = base_style.copy()
                 tight_style['size'] = max(min_font_size, font_size - size_step)
-                if self.operation_policy.get('allow_line_spacing', True):
-                    tight_style['line'] = min_line
+                tight_style['line'] = base_line
                 if self.operation_policy.get('allow_char_spacing', True):
                     tight_style['char'] = min_char
                 
@@ -670,7 +846,7 @@ class ReflowAgent:
         # ===== 策略4: 仍然溢出 -> 标记 =====
         tight_max = base_style.copy()
         tight_max['size'] = font_size if font_size_locked else min_font_size
-        tight_max['line'] = min_line
+        tight_max['line'] = base_line
         tight_max['char'] = min_char
         m_max = self.tool.simulate_layout_metrics(bbox, text, tight_max)
         safe_box_height = m_max['box_height'] * safe_fill_limit
@@ -693,11 +869,14 @@ class ReflowAgent:
             dict: 统计信息 {'round_1': count, ..., 'total_blocks': count}
         """
         total_round_budget = max(1, int(max_rounds))
-        iterative_rounds = max(1, total_round_budget - 1) if enable_rewrite else 1
+        rewrite_rounds = max(1, total_round_budget - 1) if enable_rewrite else 0
+        iterative_rounds = rewrite_rounds + 1
         print(
             f"[Reflow] Rendering... "
             f"(rewrite={'ON' if enable_rewrite else 'OFF'}, "
-            f"total_round_budget={total_round_budget}, iterative_rounds={iterative_rounds}, m0_inclusive=True)"
+            f"total_round_budget={total_round_budget}, "
+            f"rewrite_rounds={rewrite_rounds}, "
+            f"iterative_rounds={iterative_rounds}, m0_inclusive=True)"
         )
         processed_lids = set()
 
@@ -707,6 +886,7 @@ class ReflowAgent:
         # [V10 新增] 统计每轮满足要求的block数量
         round_stats = {
             'total_round_budget_including_m0': total_round_budget,
+            'rewrite_rounds': rewrite_rounds,
             'iterative_reflow_rounds': iterative_rounds,
         }
         round_stats.update({f'round_{i+1}': 0 for i in range(iterative_rounds)})
@@ -717,8 +897,13 @@ class ReflowAgent:
             if self.planner:
                 self.planner.start_round(round_i + 1)
             column_joint_plan = self._prepare_column_joint_plan(data)
-            is_final_round = (round_i == iterative_rounds - 1)  # [V10] 标记最后一轮
-            round_label = "Final (Force Satisfy)" if is_final_round else f"{round_i+1}/{iterative_rounds}"
+            is_final_round = (round_i == iterative_rounds - 1)  # [V10] 标记最终兜底轮
+            if is_final_round:
+                round_label = "Final (Force Satisfy)"
+            elif rewrite_rounds > 0:
+                round_label = f"{round_i+1}/{rewrite_rounds}"
+            else:
+                round_label = "1/1"
             print(f"\n>> Round {round_label}")
             needs_rewrite = False
             satisfied_this_round = 0
@@ -773,15 +958,17 @@ class ReflowAgent:
                 joint_hint = column_joint_plan.get(lid)
 
                 if status in {'tuned_compact', 'tuned_expand'}:
-                    physical_actions.extend(['LineSpacing', 'CharSpacing'])
+                    physical_actions.extend(['CharSpacing'])
                 elif status == 'tuned_size_down':
-                    physical_actions.extend(['FontSize', 'LineSpacing', 'CharSpacing'])
+                    physical_actions.extend(['FontSize', 'CharSpacing'])
                 
                 # [V6 修复] 标题类型永不触发重写，只调整字号
                 font_key = golden_style.get('font_key', '')
                 is_title = font_key in ('title', 'heading') or 'section_header' in itype or 'title' in itype
-                underflow_threshold = self._underflow_threshold(font_key, is_title)
+                underflow_threshold = self._underflow_threshold(font_key, is_title, lid=lid)
                 rewrite_allowed = self._rewrite_allowed_for_block(item, lid, text, font_key, itype)
+                fragile_metadata = self._is_fragile_metadata_block(item=item, lid=lid, font_key=font_key, detected_type=itype)
+                fragile_multibox_underflow = self._is_fragile_multibox_underflow_block(lid=lid, font_key=font_key)
                 
                 # [V10] 判断是否满足排版要求
                 is_satisfied = False
@@ -796,9 +983,9 @@ class ReflowAgent:
                                 is_final_round=is_final_round,
                             )
                         decision = planner_feedback.get('decision', 'rewrite_and_tune') if planner_feedback else 'rewrite_and_tune'
-                        if is_title:
+                        if is_title or fragile_metadata:
                             # 标题溢出：锁字号后不再缩字号，只保留微调/接受溢出
-                            print(f"   [!] Block {lid} Title Overflow {overflow_px:.1f}px -> ACCEPT MICRO-TUNE (no rewrite)")
+                            print(f"   [!] Block {lid} {'Title' if is_title else 'Metadata'} Overflow {overflow_px:.1f}px -> ACCEPT MICRO-TUNE (no rewrite)")
                             is_satisfied = True
                             decision = 'micro_tune'
                         elif is_final_round or not rewrite_allowed:
@@ -834,8 +1021,14 @@ class ReflowAgent:
                     if final_metrics['fill_ratio'] < underflow_threshold and not is_title:
                         issue = 'UNDERFLOW'
                         current_lengthen_attempts = underflow_rewrite_attempts.get(lid, 0)
-                        max_lengthen_attempts = self._max_underflow_rewrite_attempts(item, font_key)
-                        if not rewrite_allowed:
+                        max_lengthen_attempts = self._max_underflow_rewrite_attempts(
+                            item,
+                            font_key,
+                            lid=lid,
+                            current_fill_ratio=final_metrics['fill_ratio'],
+                            bbox=bbox,
+                        )
+                        if fragile_metadata or fragile_multibox_underflow or not rewrite_allowed:
                             is_satisfied = True
                             decision = 'rewrite_blocked_accept_underfill'
                         elif is_final_round or current_lengthen_attempts >= max_lengthen_attempts:
@@ -933,14 +1126,28 @@ class ReflowAgent:
                     current_chars = max(1, len(before_text.replace(' ', '').replace('\n', '')))
                     target_chars = joint_hint.get('target_chars', 0) if joint_hint else 0
                     if not target_chars:
-                        ratio_target = self._rewrite_fill_target(issue, font_key)
+                        ratio_target = self._rewrite_fill_target(issue, font_key, lid=lid)
                         current_fill_ratio = max(0.01, final_metrics.get('fill_ratio', 1.0))
                         target_chars = max(1, int(current_chars * (ratio_target / current_fill_ratio)))
                         if issue == 'UNDERFLOW' and font_key == 'body':
-                            min_growth = 1.08 if self._layout_mode() == 'single_col' else 1.05
-                            if current_fill_ratio < max(0.01, underflow_threshold - 0.05):
-                                min_growth += 0.05
+                            min_growth = self._minimum_underflow_growth(
+                                current_fill_ratio,
+                                underflow_threshold,
+                                bbox,
+                                font_key=font_key,
+                                lid=lid,
+                            )
                             target_chars = max(target_chars, int(current_chars * min_growth))
+                            max_growth = self._maximum_underflow_growth(
+                                current_fill_ratio,
+                                bbox,
+                                font_key=font_key,
+                                lid=lid,
+                            )
+                            target_chars = min(
+                                target_chars,
+                                max(current_chars + 12, int(current_chars * max_growth)),
+                            )
                     updates = None
                     if joint_hint and self.enable_column_joint_optimization:
                         partner_lid = joint_hint.get('partner_lid')
@@ -1024,7 +1231,7 @@ class ReflowAgent:
                             mode=action,
                             target_chars=target_chars,
                             current_chars=current_chars,
-                            target_fill_ratio=self._rewrite_fill_target(issue, font_key),
+                            target_fill_ratio=self._rewrite_fill_target(issue, font_key, lid=lid),
                             current_fill_ratio=final_metrics.get('fill_ratio', 1.0),
                         )
                     if updates:
@@ -1075,6 +1282,19 @@ class ReflowAgent:
                             underflow_rewrite_attempts[lid] = underflow_rewrite_attempts.get(lid, 0) + 1
                         processed_lids.add(lid)
                         needs_rewrite = True
+                    elif action and not is_final_round:
+                        needs_rewrite = True
+                        if self.planner:
+                            self.planner.update_block_state(
+                                lid,
+                                'PENDING',
+                                round_index=round_i + 1,
+                                reason='rewrite_no_candidate_retry',
+                                metadata={
+                                    'rewrite_mode': action,
+                                    'issue': issue,
+                                },
+                            )
             
             # [V10] 统计本轮满足要求的block数量
             round_stats[f'round_{round_i+1}'] = satisfied_this_round
@@ -1108,7 +1328,7 @@ class ReflowAgent:
             itype = item.get('detected_type', raw_type).lower()
             if self._matches_preserve_type(raw_type, itype): continue
             
-            text = item.get('translated', '')
+            text = self._sanitize_render_text(item, item.get('translated', ''))
             if not text: continue
             
             # [增强] 合并 target_style 和 golden_style，确保样式信息不丢失

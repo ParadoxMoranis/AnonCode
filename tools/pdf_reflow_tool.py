@@ -441,7 +441,7 @@ class PDFReflowTool:
         
         # [WSL兼容] 获取脚本所在目录的绝对路径
         self._script_dir = os.path.dirname(os.path.abspath(__file__))
-        self._base_dir = os.path.dirname(self._script_dir)  # project root
+        self._base_dir = os.path.dirname(self._script_dir)  # agentParse 目录
         
         # [增强] 字体配置 - 支持 Regular/Bold/Italic/BoldItalic 四种变体
         # 格式: category -> variant -> [candidate paths]

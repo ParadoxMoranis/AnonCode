@@ -1,0 +1,14 @@
+runs/
+data-new/
+tmp/
+logs/
+remove/
+ablation_data/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+translation.log
+*.log
+*.pid

@@ -11,9 +11,9 @@ paths:
 translation:
   # API Configuration - Fill in your own API provider details
   api:
-    base_url: ""                    # e.g., "https://your-provider.example/v1"
+    base_url: ""                    # e.g., "https://api.openai.com/v1", "https://api.deepseek.com/v1"
     api_key: ""                     # Your API key (or use env var like ${TRANSLATION_API_KEY})
-    model: ""                       # e.g., "provider-model-large"
+    model: ""                       # e.g., "gpt-4o", "deepseek-chat", "claude-3-opus"
   
   # Translation Settings
   target_language: "zh"             # Target language (zh = Chinese)
@@ -26,9 +26,9 @@ translation:
 reflow:
   # API Configuration - Can use same or different provider
   api:
-    base_url: ""                    # e.g., "https://your-provider.example/v1"
+    base_url: ""                    # e.g., "https://api.openai.com/v1"
     api_key: ""                     # Your API key (or use env var like ${REFLOW_API_KEY})
-    model: ""                       # e.g., "provider-model-medium"
+    model: ""                       # e.g., "gpt-4o", "gpt-5"
   
   # Reflow Settings
   enabled: true                     # Enable reflow process

@@ -457,7 +457,15 @@ class TranslationPipeline:
                 results.append(self.process_paper(paper))
         
         # Save results
-        results_file = self.output_dir / "translation_results.json"
+        results_file_cfg = (
+            self.config.get('logging', {}).get('results_file')
+            or self.config.get('processing', {}).get('results_file')
+        )
+        if results_file_cfg:
+            results_file = self.base_dir / results_file_cfg
+            results_file.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            results_file = self.output_dir / "translation_results.json"
         with open(results_file, 'w', encoding='utf-8') as f:
             json.dump({
                 'results': results,
