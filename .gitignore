@@ -12,3 +12,4 @@ __pycache__/
 translation.log
 *.log
 *.pid
+.venv/

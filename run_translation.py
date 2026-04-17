@@ -8,7 +8,7 @@ Usage:
     python run_translation.py                    # Use default config.yaml
     python run_translation.py --config my.yaml   # Use custom config
     python run_translation.py --category formula # Process only formula papers
-    python run_translation.py --category 一般论文 --layout 单列
+    python run_translation.py --category general_papers --layout single_column
 """
 
 import os
@@ -122,21 +122,24 @@ class TranslationPipeline:
     """Main translation pipeline with configurable options."""
 
     CATEGORY_ALIASES = {
-        'formula': '公式论文',
-        'figure': '图表论文',
-        'general': '一般论文',
-        '公式论文': '公式论文',
-        '图表论文': '图表论文',
-        '一般论文': '一般论文',
+        'formula': 'formula_papers',
+        'formula_papers': 'formula_papers',
+        '公式论文': 'formula_papers',
+        'figure': 'figure_table_papers',
+        'figure_table_papers': 'figure_table_papers',
+        '图表论文': 'figure_table_papers',
+        'general': 'general_papers',
+        'general_papers': 'general_papers',
+        '一般论文': 'general_papers',
     }
 
     LAYOUT_ALIASES = {
-        'single_column': '单列',
-        'double_column': '双列',
-        'complex_layout': '复杂布局',
-        '单列': '单列',
-        '双列': '双列',
-        '复杂布局': '复杂布局',
+        'single_column': 'single_column',
+        '单列': 'single_column',
+        'double_column': 'double_column',
+        '双列': 'double_column',
+        'complex_layout': 'complex_layout',
+        '复杂布局': 'complex_layout',
     }
     
     def __init__(self, config: Dict):
