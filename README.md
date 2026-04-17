@@ -93,6 +93,14 @@ translation:
    - Recommended layout names: `single_column`, `double_column`, `complex_layout`
    - CLI/config aliases `formula/figure/general` plus the old Chinese names are still supported
 
+## Anonymous Review Data
+
+The anonymous review dataset is available via the following read-only link:
+
+- <https://1drv.ms/f/c/b88e4751feafd568/IgBter4ZOKmrRqvs149DgzMtAS5vOBilMz5W836CQqHI-vk?e=3yMUxm>
+
+The shared folder contains the review data packages corresponding to the paper categories used in this repository.
+
 ## Configuration
 
 Edit `config.yaml` to customize the pipeline:
